@@ -1,0 +1,10 @@
+#Python
+api/venv/
+__pycache__/
+*.pyc
+
+#C
+
+
+#VS Code
+.vscode/
