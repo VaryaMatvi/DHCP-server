@@ -4,7 +4,9 @@ __pycache__/
 *.pyc
 
 #C
-
+*.out
 
 #VS Code
 .vscode/
+
+config_receiver_sender_test.c
