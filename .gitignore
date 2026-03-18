@@ -9,4 +9,5 @@ __pycache__/
 #VS Code
 .vscode/
 
-config_receiver_sender_test.c
+#tests
+*_test.c

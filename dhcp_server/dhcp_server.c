@@ -1,8 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <time.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <hiredis/hiredis.h>
 
 #define MAX_DNS 4
@@ -22,16 +24,18 @@ typedef struct {
     unsigned char msg_type;
 }dhcp_fields;
 
-//keeped in BigEndian
 struct Config{
-    unsigned char subnet[4];
-    unsigned char netmask[4];
-    int lease_time;
-    unsigned char dns_servers[MAX_DNS][4];
+    uint32_t subnet;
+    uint32_t netmask;
+    uint32_t lease_time;
+    char dns_servers[MAX_DNS][4]; //keeped in BigEndian
     int dns_count;
+
+    uint32_t ip;
 };
 
 struct Config config;
+u_int16_t ID = 0; //servers global counter
 
 //configuration setter
 void load_config(const char *filename)
@@ -46,30 +50,29 @@ void load_config(const char *filename)
     while (fgets(line, sizeof(line), f)) {
         char *key = strtok(line, ":");
         char *value = strtok(NULL, "\n");
-        struct in_addr addr;
+        uint32_t addr;
         if (key && value) {
             value[strcspn(value, "\r\n")] = '\0';
             if (strcmp(key, "subnet") == 0) 
             {
                 inet_pton(AF_INET, value, &addr);
-                memcpy(config.subnet, &addr.s_addr, 4);
+                config.subnet = ntohl(addr);
             }
             else if (strcmp(key, "netmask") == 0)
             {
                 inet_pton(AF_INET, value, &addr);
-                memcpy(config.netmask, &addr.s_addr, 4);
+                config.netmask = ntohl(addr);     
             }
             else if (strcmp(key, "lease_time") == 0) config.lease_time = atoi(value);
             else if (strcmp(key, "dns_servers") == 0)
             {
                 char *dns = strtok(value, ",");
                 int n = 0;
-                struct in_addr addr;
 
                 while (dns && n < MAX_DNS) {
                     dns[strcspn(dns, "\r\n")] = '\0';
                     inet_pton(AF_INET, dns, &addr);
-                    memcpy(config.dns_servers[n], &addr.s_addr, 4);
+                    memcpy(config.dns_servers[n], &addr, 4);
                     n++;
                     dns = strtok(NULL, ",");
                 }
@@ -108,7 +111,8 @@ void dhcp_receiver(const unsigned char *buf, char* mac, dhcp_fields *r)
 }
 
 //forms a packet for the response and returns as the parameter buf
-void dhcp_sender(unsigned char *buf, int buf_size, dhcp_fields *r)
+//returns new buf_size
+int dhcp_sender(unsigned char *buf, int buf_size, dhcp_fields *r)
 {
     int i=0; //byte counter
     memset(buf, 0, buf_size);
@@ -162,13 +166,88 @@ void dhcp_sender(unsigned char *buf, int buf_size, dhcp_fields *r)
     i += 4;
     buf[i++] = 1; //mask
     buf[i++] = 4;
-    memcpy(buf+i, config.netmask, 4);
+    uint32_t netmask = htonl(config.netmask);
+    memcpy(buf+i, &netmask, 4);
     i += 4;
     buf[i++] = 6; //dns
     buf[i++] = 4*config.dns_count;
     memcpy(buf+i, config.dns_servers, 4*config.dns_count);
     i += 4*config.dns_count;
     buf[i++] = 255; //end option
+
+    return i;
 }
 
+void packet_parser(unsigned char *data_buf, const unsigned char *packet_buf)
+{
+    //eth_header first 14 bytes
+    unsigned char *ip_header = packet_buf + 14;
+    if (((ip_header[0] & 0xF0) >> 4) != 4) return; //not IPv4
+    if (ip_header[9] != 17) return; //not UDP
+    uint32_t dest_addr;
+    memcpy(&dest_addr, ip_header+16, 4);
+    dest_addr = ntohl(dest_addr);
+    
 
+    uint32_t net_broadcast = (config.netmask & config.subnet) | (~config.netmask);
+    if (dest_addr != config.ip && dest_addr != 0xFFFFFFFF && dest_addr != net_broadcast) return; //another ip
+
+    unsigned int ihl = ip_header[0] & 0x0F; //ip header len in dwords
+    unsigned char *udp_header = ip_header + ihl * 4;
+    
+    uint16_t source_port, dest_port;
+    memcpy(&source_port, udp_header, 2);
+    source_port = ntohs(source_port);
+    memcpy(&dest_port, udp_header+2, 2);
+    dest_port = ntohs(dest_port);
+    if (source_port != 68 || dest_port != 67) return; //not DHCP
+
+    uint16_t payload_length;
+    memcpy(&payload_length, udp_header+4, 2);
+    payload_length = ntohs(payload_length);
+    payload_length -= 8; //minus udp_header length
+    memcpy(data_buf, udp_header+8, payload_length);
+    return;
+}
+
+//rebuilds the received packet (packet buf)
+void packet_formater(const unsigned char *data_buf, int data_buf_size, unsigned char *packet_buf, dhcp_fields *fields)
+{
+    //Eth-header, 14 bytes
+    //swaps source and dest macs 
+    unsigned char temp_mac[6];
+    memcpy(temp_mac, packet_buf, 6);
+    memcpy(packet_buf, packet_buf+6, 6);
+    memcpy(packet_buf+6, temp_mac, 6);
+
+    //ip-header
+    unsigned char *ip_header = packet_buf + 14;
+    ip_header[0] = 0x45; //v4, IHL=5
+    ip_header[1] = 0; //DSCP, ECN
+    uint16_t ip_total_length = htons(20 + 8 + data_buf_size); //ip-header+udp-header+payload
+    memcpy(ip_header+2, &ip_total_length, 2);
+    uint16_t id = htons(ID);
+    memcpy(ip_header+4, &id, 2);
+    ID++;
+    
+    //flags+offset, DF=1, MF=0, offset=0
+    ip_header[6] = 0x40;
+    ip_header[7] = 0;
+    ip_header[8] = 64; //TTL
+    ip_header[9] = 17; //UDP
+    memset(ip_header+10, 0, 2);//checksum
+    
+    memcpy(ip_header+12, fields->siaddr, 4);
+    memcpy(ip_header+16, fields->yiaddr, 4);
+
+    //udp-header
+    unsigned char *udp_header = ip_header + 20;
+    uint16_t source_port = htons(68), dest_port = htons(67);
+    memcpy(udp_header, &source_port, 2);
+    memcpy(udp_header+2, &dest_port, 2);
+    uint16_t udp_length = htons(8 + data_buf_size);
+    memcpy(udp_header+4, &udp_length, 2);
+    memset(udp_header+6, 0, 2); //checksum
+
+    memcpy(udp_header+8, data_buf, data_buf_size);
+}
