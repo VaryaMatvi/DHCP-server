@@ -14,12 +14,14 @@
 #include <linux/if_packet.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
-#
 
-
-#define ETH_NAME "lo" //listening interface name
-#define VLEN 10 //max count of messages for a socket
+#define ETH_NAME "veth0" //listening interface name
+#define HASH "dhcp:mappings" //Redis hash
+#define VLEN 4 //max count of messages for a socket
 #define MAX_PACKET_SIZE 1024
+#define MAX_DHCP 576
+#define MAX_RING_BUF_SIZE 32    //max requests in the ring buffer
+#define RING_BUF_TRIGGER_COUNT 3 //start processing
 
 #define MAX_DNS 4
 
@@ -28,8 +30,10 @@
 #define DHCPOFFER 2
 #define DHCPREQUEST 3
 #define DHCPACK 5
+#define DHCPERR "err"
 
 
+//keeped in BE
 typedef struct {
     unsigned char xid[4]; //unique transaction id
     unsigned char yiaddr[4]; //new client ip
@@ -38,14 +42,23 @@ typedef struct {
     unsigned char msg_type;
 }dhcp_fields;
 
+typedef unsigned char mac[18];
+typedef struct{
+    mac requests[MAX_RING_BUF_SIZE]; //keeps MACs for the Redis
+    int head;
+    int tail;
+    int count;
+}ring_buffer;
+
 struct Config{
     uint32_t subnet;
     uint32_t netmask;
     uint32_t lease_time;
-    char dns_servers[MAX_DNS][4]; //keeped in BigEndian
+    unsigned char dns_servers[MAX_DNS][4]; //keeped in BigEndian
     int dns_count;
 
     uint32_t ip;
+    unsigned char mac[6];
 };
 
 struct Config config;
@@ -119,17 +132,17 @@ void dhcp_receiver(const unsigned char *buf, char* mac, dhcp_fields *r)
                 r->msg_type = buf[i+2];
                 break;
             }
-            i += (buf[i+1] + 1); //len field
+            i += (buf[i+1] + 2); //len field
         }
     }
 }
 
 //forms a packet for the response and returns as the parameter buf
 //returns new buf_size
-int dhcp_sender(unsigned char *buf, int buf_size, dhcp_fields *r)
+int dhcp_sender(unsigned char *buf, dhcp_fields *r)
 {
     int i=0; //byte counter
-    memset(buf, 0, buf_size);
+    memset(buf, 0, MAX_DHCP);
 
     //DHCP structure
     buf[i++] = 0x02; //op
@@ -192,50 +205,54 @@ int dhcp_sender(unsigned char *buf, int buf_size, dhcp_fields *r)
     return i;
 }
 
-void packet_parser(unsigned char *data_buf, const unsigned char *packet_buf)
+//returns payload_length
+int packet_parser(unsigned char *data_buf, const unsigned char *packet_buf)
 {
-    //eth_header first 14 bytes
+    //skip eth_header first 14 bytes
+    //ip_header parsing
     unsigned char *ip_header = packet_buf + 14;
-    if (((ip_header[0] & 0xF0) >> 4) != 4) return; //not IPv4
-    if (ip_header[9] != 17) return; //not UDP
+    if (((ip_header[0] & 0xF0) >> 4) != 4) return -1; //not IPv4
+    if (ip_header[9] != 17) return -1; //not UDP
     uint32_t dest_addr;
     memcpy(&dest_addr, ip_header+16, 4);
     dest_addr = ntohl(dest_addr);
     
 
     uint32_t net_broadcast = (config.netmask & config.subnet) | (~config.netmask);
-    if (dest_addr != config.ip && dest_addr != 0xFFFFFFFF && dest_addr != net_broadcast) return; //another ip
+    if (dest_addr != config.ip && dest_addr != 0xFFFFFFFF && dest_addr != net_broadcast) return -1; //another ip
 
-    unsigned int ihl = ip_header[0] & 0x0F; //ip header len in dwords
+    unsigned int ihl = ip_header[0] & 0x0F; //ip-header len in dwords
+
+    //udp-header parcing
     unsigned char *udp_header = ip_header + ihl * 4;
-    
     uint16_t source_port, dest_port;
     memcpy(&source_port, udp_header, 2);
     source_port = ntohs(source_port);
     memcpy(&dest_port, udp_header+2, 2);
     dest_port = ntohs(dest_port);
-    if (source_port != 68 || dest_port != 67) return; //not DHCP
+    if (source_port != 68 || dest_port != 67) return -1; //not DHCP
 
     uint16_t payload_length;
     memcpy(&payload_length, udp_header+4, 2);
     payload_length = ntohs(payload_length);
     payload_length -= 8; //minus udp_header length
+
+    if (payload_length > MAX_DHCP) return -1;
     memcpy(data_buf, udp_header+8, payload_length);
-    return;
+    return payload_length;
 }
 
-//rebuilds the received packet (packet buf)
-void packet_formater(const unsigned char *data_buf, int data_buf_size, unsigned char *packet_buf, dhcp_fields *fields)
+//builds the packet to answer (packet buf_ans), returns total len
+int packet_formater(const unsigned char *data_buf, int data_buf_size, unsigned char *packet_buf_ans, dhcp_fields *fields)
 {
     //Eth-header, 14 bytes
-    //swaps source and dest macs 
-    unsigned char temp_mac[6];
-    memcpy(temp_mac, packet_buf, 6);
-    memcpy(packet_buf, packet_buf+6, 6);
-    memcpy(packet_buf+6, temp_mac, 6);
+    memcpy(packet_buf_ans, fields->chaddr, 6); //dest mac (client)
+    memcpy(packet_buf_ans+6, config.mac, 6); //source mac (server)
+    packet_buf_ans[12] = 0x08; //ipv4
+    packet_buf_ans[13] = 0;
 
     //ip-header
-    unsigned char *ip_header = packet_buf + 14;
+    unsigned char *ip_header = packet_buf_ans + 14;
     ip_header[0] = 0x45; //v4, IHL=5
     ip_header[1] = 0; //DSCP, ECN
     uint16_t ip_total_length = htons(20 + 8 + data_buf_size); //ip-header+udp-header+payload
@@ -251,12 +268,13 @@ void packet_formater(const unsigned char *data_buf, int data_buf_size, unsigned 
     ip_header[9] = 17; //UDP
     memset(ip_header+10, 0, 2);//checksum
     
-    memcpy(ip_header+12, fields->siaddr, 4);
+    uint32_t ip = htonl(config.ip);
+    memcpy(ip_header+12, &ip, 4);
     memcpy(ip_header+16, fields->yiaddr, 4);
 
     //udp-header
     unsigned char *udp_header = ip_header + 20;
-    uint16_t source_port = htons(68), dest_port = htons(67);
+    uint16_t source_port = htons(67), dest_port = htons(68);
     memcpy(udp_header, &source_port, 2);
     memcpy(udp_header+2, &dest_port, 2);
     uint16_t udp_length = htons(8 + data_buf_size);
@@ -264,11 +282,99 @@ void packet_formater(const unsigned char *data_buf, int data_buf_size, unsigned 
     memset(udp_header+6, 0, 2); //checksum
 
     memcpy(udp_header+8, data_buf, data_buf_size);
+
+    return 14 + 20 + 8 + data_buf_size; //ethernet + ip + udp + payload
+}
+
+//pipeline processing of the Redis requests, send answers
+int rb_process(ring_buffer *rb, redisContext *ctx, dhcp_fields *requests, int sockfd, struct sockaddr_ll dest_addr)
+{
+    //save count and head for requests
+    int n = rb->count;
+    int head = rb -> head;
+    int head_append = rb -> head;
+
+    unsigned char answer_data_buf[MAX_DHCP];
+    unsigned char answer_buf[MAX_PACKET_SIZE];
+    int answer_data_len, total_len;
+
+    if (n == 0)
+    {
+        printf("No requests\n");
+        return 0;
+    }
+    for (int i=0; i<n; i++)
+    {
+        redisAppendCommand(ctx, "HGET %s %s", HASH, rb->requests[head_append]);
+        rb->count--;
+        head_append = (head_append + 1) % MAX_RING_BUF_SIZE;
+    }
+    
+    for (int i=0; i<n; i++)
+    {
+        redisReply *r;
+        redisGetReply(ctx, (void**)&r);
+        if (r != NULL && r->type == REDIS_REPLY_STRING) //got ip
+        {
+
+            printf("Got IP: %s\n", r->str);
+            uint32_t client_ip;
+            inet_pton(AF_INET, r->str, &client_ip);
+            memcpy(requests[head].yiaddr, &client_ip, sizeof(client_ip));
+
+            uint32_t s_ip = htonl(config.ip);
+            memcpy(requests[head].siaddr, &s_ip, 4);
+
+            answer_data_len = dhcp_sender(answer_data_buf, &requests[head]);
+            total_len = packet_formater(answer_data_buf, answer_data_len, answer_buf, &requests[head]);
+
+            memcpy(dest_addr.sll_addr, requests[head].chaddr, 6);
+
+            printf("sending answer\n");
+            sendto(sockfd, answer_buf, total_len, 0, (struct sockaddr *) &dest_addr, sizeof(dest_addr));
+        }
+        else if (r -> type == REDIS_REPLY_NIL)
+        {
+            printf("MAC is not found\n");
+            memcpy(requests[head].yiaddr, DHCPERR, sizeof(DHCPERR));
+        }
+        freeReplyObject(r);
+
+        head = (head + 1) % MAX_RING_BUF_SIZE;
+    }
+
+    rb -> count = 0;
+    rb -> head = head;
+    rb -> tail = rb -> head;
+    return 0;
+}
+
+int new_rb_record(ring_buffer *rb)
+{
+    rb->count++;
+    rb->tail = (rb->tail + 1) % MAX_RING_BUF_SIZE;
+    if (rb->count == MAX_RING_BUF_SIZE)
+    {
+        printf("Buffer is full\n");
+        return 1;
+        //could be rb_process(rb, ctx, requests);
+        //if overflowing process -> overtime sending
+    }
+    return 0;
 }
 
 int main()
 {
     load_config("dhcp_config.txt");
+
+    redisContext *ctx = redisConnect("127.0.0.1", 6379); //connect localhost Redis
+    if (ctx == NULL || ctx -> err){
+        if (ctx){
+            printf("Error %s\n", ctx->errstr);
+            redisFree(ctx);
+        }
+        exit(1);
+    }
 
     int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
 
@@ -278,9 +384,12 @@ int main()
     strncpy(ifr.ifr_name, ETH_NAME, sizeof(ETH_NAME));
     ioctl(sockfd, SIOCGIFINDEX, &ifr); //gets interface index
     ioctl(sockfd, SIOCGIFADDR, &ifr); //gets interface ip addr
+    ioctl(sockfd, SIOCGIFHWADDR, &ifr); //gets interface mac addr
+
     struct sockaddr_in* addr_in = (struct sockaddr_in*)&ifr.ifr_addr;
     config.ip = ntohl(addr_in->sin_addr.s_addr); //sets server's ip
-
+    unsigned char *ifr_mac = (unsigned char *) ifr.ifr_hwaddr.sa_data;
+    memcpy(config.mac, ifr_mac, 6); //sets server's mac
 
     //setting addr params
     memset(&server, 0, sizeof(server)); 
@@ -296,6 +405,7 @@ int main()
     unsigned char bufs[VLEN][MAX_PACKET_SIZE];
     struct timespec timeout;
     timeout.tv_sec = 10;
+    timeout.tv_nsec = 0;
 
     //initialize msgvec
     memset(msgvec, 0, sizeof(msgvec));
@@ -306,19 +416,49 @@ int main()
         msgvec[i].msg_hdr.msg_iovlen = 1;
     }
 
+    //initialize ring buffer
+    ring_buffer rb;
+    rb.count = 0;
+    rb.head = 0;
+    rb.tail = 0;
+    memset(rb.requests, 0, sizeof(rb.requests));
+
+    //initialize payload DHCP bufs, request DHCP fields
+    unsigned char received_buf[VLEN][MAX_DHCP];
+    dhcp_fields requests[MAX_RING_BUF_SIZE]; //syncronized with ring buffer
+
+
     //infinity receive cycle
     while(1)
     {
         int received = recvmmsg(sockfd, msgvec, VLEN, 0, &timeout);
         if (received > 0) {
-            printf("Packet received\n");
+            for (int i=0; i<received; i++)
+            {
+                int p_len = packet_parser(received_buf[i], bufs[i]);
+                if (p_len <= 0) continue;
+                printf("Packet received: %d\n", received);
+                dhcp_receiver(received_buf[i], rb.requests[rb.tail], &requests[rb.tail]);
+                if (new_rb_record(&rb))
+                {
+                    rb_process(&rb, ctx, requests, sockfd, server);
+                }
+            }
+            if (rb.count >= RING_BUF_TRIGGER_COUNT)
+            {
+                rb_process(&rb, ctx, requests, sockfd, server);
+            }
+
         } else if (received == 0) {
             printf("timeout\n");
+            if (rb.count > 0) rb_process(&rb, ctx, requests, sockfd, server);
         } else {
             perror("recvmmsg\n");
+            break;
         }
         }
-
+    
+    redisFree(ctx);
     close(sockfd);
     return 0;
 }

@@ -10,8 +10,8 @@ app = FastAPI()
 r = aioredis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 DHCP_HASH = "dhcp:mappings"
 
-MAC_PATTERN = "^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$"
-IP_PATTERN = "^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"
+MAC_PATTERN = r"^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$"
+IP_PATTERN = r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"
 
 #Pydantic DHCP model with format validation patterns
 class Mapping(BaseModel):
