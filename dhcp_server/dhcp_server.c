@@ -1,11 +1,25 @@
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <hiredis/hiredis.h>
+#include <sys/socket.h>
+#include <net/ethernet.h>
+#include <linux/if_packet.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#
+
+
+#define ETH_NAME "lo" //listening interface name
+#define VLEN 10 //max count of messages for a socket
+#define MAX_PACKET_SIZE 1024
 
 #define MAX_DNS 4
 
@@ -250,4 +264,61 @@ void packet_formater(const unsigned char *data_buf, int data_buf_size, unsigned 
     memset(udp_header+6, 0, 2); //checksum
 
     memcpy(udp_header+8, data_buf, data_buf_size);
+}
+
+int main()
+{
+    load_config("dhcp_config.txt");
+
+    int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
+
+    struct sockaddr_ll server;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ETH_NAME, sizeof(ETH_NAME));
+    ioctl(sockfd, SIOCGIFINDEX, &ifr); //gets interface index
+    ioctl(sockfd, SIOCGIFADDR, &ifr); //gets interface ip addr
+    struct sockaddr_in* addr_in = (struct sockaddr_in*)&ifr.ifr_addr;
+    config.ip = ntohl(addr_in->sin_addr.s_addr); //sets server's ip
+
+
+    //setting addr params
+    memset(&server, 0, sizeof(server)); 
+    server.sll_family = AF_PACKET;
+    server.sll_protocol = htons(ETH_P_IP);
+    server.sll_ifindex = ifr.ifr_ifindex;
+    server.sll_halen = ETH_ALEN;
+
+    bind(sockfd, (struct sockaddr *) &server, sizeof(server)); 
+
+    struct mmsghdr msgvec[VLEN];
+    struct iovec iovecs[VLEN];
+    unsigned char bufs[VLEN][MAX_PACKET_SIZE];
+    struct timespec timeout;
+    timeout.tv_sec = 10;
+
+    //initialize msgvec
+    memset(msgvec, 0, sizeof(msgvec));
+    for (int i = 0; i < VLEN; i++) {
+        iovecs[i].iov_base = bufs[i];
+        iovecs[i].iov_len  = MAX_PACKET_SIZE;
+        msgvec[i].msg_hdr.msg_iov    = &iovecs[i];
+        msgvec[i].msg_hdr.msg_iovlen = 1;
+    }
+
+    //infinity receive cycle
+    while(1)
+    {
+        int received = recvmmsg(sockfd, msgvec, VLEN, 0, &timeout);
+        if (received > 0) {
+            printf("Packet received\n");
+        } else if (received == 0) {
+            printf("timeout\n");
+        } else {
+            perror("recvmmsg\n");
+        }
+        }
+
+    close(sockfd);
+    return 0;
 }
