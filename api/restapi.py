@@ -5,8 +5,13 @@ from typing import Annotated
 from pydantic import BaseModel, Field
 import redis.asyncio as aioredis
 
+#for correct redis exit
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    await r.aclose()
 
-app = FastAPI()
+app = FastAPI(lifespan = lifespan)
 r = aioredis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 DHCP_HASH = "dhcp:mappings"
 
@@ -17,12 +22,6 @@ IP_PATTERN = r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-
 class Mapping(BaseModel):
     mac: str = Field(title="MAC", description="XX:XX:XX:XX:XX:XX format", pattern=MAC_PATTERN)
     ip: str = Field(title="IP", description="X.X.X.X format", pattern=IP_PATTERN)
-
-#for correct redis exit
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
-    await r.aclose()
 
 #Adds a new mapping {mac: ip}
 @app.post("/mappings")

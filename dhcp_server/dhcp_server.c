@@ -14,6 +14,7 @@
 #include <linux/if_packet.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
+#include <errno.h>
 
 #define ETH_NAME "veth0" //listening interface name
 #define HASH "dhcp:mappings" //Redis hash
@@ -21,11 +22,12 @@
 #define MAX_PACKET_SIZE 1024
 #define MAX_DHCP 576
 #define MAX_RING_BUF_SIZE 32    //max requests in the ring buffer
-#define RING_BUF_TRIGGER_COUNT 3 //start processing
+#define RING_BUF_TRIGGER_COUNT 16 //start processing
+#define RING_BUF_TIMEOUT 3 //ring buffer timeout in secs
 
 #define MAX_DNS 4
 
-#define MAGICCOOKIE 0x63538263 
+#define MAGICCOOKIE 0x63825363 
 #define DHCPDISCOVER 1
 #define DHCPOFFER 2
 #define DHCPREQUEST 3
@@ -39,7 +41,7 @@ typedef struct {
     unsigned char yiaddr[4]; //new client ip
     unsigned char siaddr[4]; //servers ip
     unsigned char chaddr[16]; //client's MAC
-    unsigned char msg_type;
+    unsigned char msg_type; //client's msg type
 }dhcp_fields;
 
 typedef unsigned char mac[18];
@@ -48,6 +50,7 @@ typedef struct{
     int head;
     int tail;
     int count;
+    struct timespec last_p_time;
 }ring_buffer;
 
 struct Config{
@@ -63,6 +66,7 @@ struct Config{
 
 struct Config config;
 u_int16_t ID = 0; //servers global counter
+int g_if_index = 0; //global if index
 
 //configuration setter
 void load_config(const char *filename)
@@ -112,7 +116,7 @@ void load_config(const char *filename)
 }
 
 //processes data and returns mac and xid(unique transaction id) as a parameter
-void dhcp_receiver(const unsigned char *buf, char* mac, dhcp_fields *r)
+int dhcp_receiver(const unsigned char *buf, char* mac, dhcp_fields *r)
 {
     const unsigned char *chaddr = buf + 28; //chaddr offset is 28 bytes, length=16
     memcpy(r->chaddr, chaddr, 16);
@@ -124,17 +128,17 @@ void dhcp_receiver(const unsigned char *buf, char* mac, dhcp_fields *r)
     uint32_t magic_cookie;
     memcpy(&magic_cookie, buf + 236, 4);
     int i = 240;
-    if (magic_cookie == MAGICCOOKIE)
+    if (ntohl(magic_cookie) != MAGICCOOKIE) return -1;
+    while (buf[i] != 255) //end option
     {
-        while (buf[i] != 255) //end option
-        {
-            if (buf[i] == 53) {
-                r->msg_type = buf[i+2];
-                break;
-            }
-            i += (buf[i+1] + 2); //len field
+        if (buf[i] == 53) {
+             r->msg_type = buf[i+2];
+            break;
         }
+        i += (buf[i+1] + 2); //len field
     }
+    if (r -> msg_type != DHCPDISCOVER && r -> msg_type != DHCPREQUEST) return -1;
+    return 0;
 }
 
 //forms a packet for the response and returns as the parameter buf
@@ -164,7 +168,7 @@ int dhcp_sender(unsigned char *buf, dhcp_fields *r)
     i += 64; //zero sname
     i += 128; //zero file
 
-    unsigned int magic_cookie = MAGICCOOKIE;
+    unsigned int magic_cookie = htonl(MAGICCOOKIE);
     memcpy(buf+i, &magic_cookie, 4); //options
     i += 4;
     buf[i++] = 53; //msgtype
@@ -242,6 +246,25 @@ int packet_parser(unsigned char *data_buf, const unsigned char *packet_buf)
     return payload_length;
 }
 
+//cheksums for testing
+uint16_t ip_checksum(void *vdata, size_t length) {
+    char *data = (char *)vdata;
+    uint32_t acc = 0xffff;
+    for (size_t i = 0; i + 1 < length; i += 2) {
+        uint16_t word;
+        memcpy(&word, data + i, 2);
+        acc += ntohs(word);
+        if (acc > 0xffff) acc -= 0xffff;
+    }
+    if (length & 1) {
+        uint16_t word = 0;
+        memcpy(&word, data + length - 1, 1);
+        acc += ntohs(word);
+        if (acc > 0xffff) acc -= 0xffff;
+    }
+    return htons(~acc);
+}
+
 //builds the packet to answer (packet buf_ans), returns total len
 int packet_formater(const unsigned char *data_buf, int data_buf_size, unsigned char *packet_buf_ans, dhcp_fields *fields)
 {
@@ -269,8 +292,13 @@ int packet_formater(const unsigned char *data_buf, int data_buf_size, unsigned c
     memset(ip_header+10, 0, 2);//checksum
     
     uint32_t ip = htonl(config.ip);
-    memcpy(ip_header+12, &ip, 4);
-    memcpy(ip_header+16, fields->yiaddr, 4);
+    memcpy(ip_header+12, &ip, 4); //ip source
+    //ip dest
+    if (fields->msg_type == DHCPDISCOVER) memset(ip_header+16, 0xFF, 4);
+    else if (fields -> msg_type == DHCPREQUEST) memcpy(ip_header+16, fields->yiaddr, 4); 
+
+    uint16_t ip_csum = ip_checksum(ip_header, 20);
+    memcpy(ip_header+10, &ip_csum, 2);
 
     //udp-header
     unsigned char *udp_header = ip_header + 20;
@@ -279,7 +307,7 @@ int packet_formater(const unsigned char *data_buf, int data_buf_size, unsigned c
     memcpy(udp_header+2, &dest_port, 2);
     uint16_t udp_length = htons(8 + data_buf_size);
     memcpy(udp_header+4, &udp_length, 2);
-    memset(udp_header+6, 0, 2); //checksum
+    memset(udp_header+6, 0, 2); //zero checksum
 
     memcpy(udp_header+8, data_buf, data_buf_size);
 
@@ -300,7 +328,6 @@ int rb_process(ring_buffer *rb, redisContext *ctx, dhcp_fields *requests, int so
 
     if (n == 0)
     {
-        printf("No requests\n");
         return 0;
     }
     for (int i=0; i<n; i++)
@@ -320,7 +347,7 @@ int rb_process(ring_buffer *rb, redisContext *ctx, dhcp_fields *requests, int so
             printf("Got IP: %s\n", r->str);
             uint32_t client_ip;
             inet_pton(AF_INET, r->str, &client_ip);
-            memcpy(requests[head].yiaddr, &client_ip, sizeof(client_ip));
+            memcpy(requests[head].yiaddr, &client_ip, sizeof(client_ip)); 
 
             uint32_t s_ip = htonl(config.ip);
             memcpy(requests[head].siaddr, &s_ip, 4);
@@ -328,15 +355,21 @@ int rb_process(ring_buffer *rb, redisContext *ctx, dhcp_fields *requests, int so
             answer_data_len = dhcp_sender(answer_data_buf, &requests[head]);
             total_len = packet_formater(answer_data_buf, answer_data_len, answer_buf, &requests[head]);
 
-            memcpy(dest_addr.sll_addr, requests[head].chaddr, 6);
+            //dest_addr structure for the sendto
+            memcpy(dest_addr.sll_addr, requests[head].chaddr, 6); //dest mac
+            dest_addr.sll_ifindex = g_if_index; //if index
 
             printf("sending answer\n");
-            sendto(sockfd, answer_buf, total_len, 0, (struct sockaddr *) &dest_addr, sizeof(dest_addr));
+            ssize_t sent = sendto(sockfd, answer_buf, total_len, 0, (struct sockaddr *) &dest_addr, sizeof(dest_addr));
+            if (sent != total_len) {
+                perror("sendto");
+            } else {
+                printf("Sent %d bytes\n", sent);
+            }
         }
         else if (r -> type == REDIS_REPLY_NIL)
         {
             printf("MAC is not found\n");
-            memcpy(requests[head].yiaddr, DHCPERR, sizeof(DHCPERR));
         }
         freeReplyObject(r);
 
@@ -346,6 +379,7 @@ int rb_process(ring_buffer *rb, redisContext *ctx, dhcp_fields *requests, int so
     rb -> count = 0;
     rb -> head = head;
     rb -> tail = rb -> head;
+    clock_gettime(CLOCK_MONOTONIC, &rb->last_p_time);
     return 0;
 }
 
@@ -357,8 +391,6 @@ int new_rb_record(ring_buffer *rb)
     {
         printf("Buffer is full\n");
         return 1;
-        //could be rb_process(rb, ctx, requests);
-        //if overflowing process -> overtime sending
     }
     return 0;
 }
@@ -382,12 +414,28 @@ int main()
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, ETH_NAME, sizeof(ETH_NAME));
-    ioctl(sockfd, SIOCGIFINDEX, &ifr); //gets interface index
-    ioctl(sockfd, SIOCGIFADDR, &ifr); //gets interface ip addr
-    ioctl(sockfd, SIOCGIFHWADDR, &ifr); //gets interface mac addr
+    if (ioctl(sockfd, SIOCGIFINDEX, &ifr) == -1) {
+        perror("ioctl SIOCGIFINDEX");
+        exit(1);
+    }
 
+    server.sll_ifindex = ifr.ifr_ifindex;
+    printf("Server index set %d\n", server.sll_ifindex);
+    g_if_index = ifr.ifr_ifindex;
+
+    if (ioctl(sockfd, SIOCGIFADDR, &ifr) == -1) //gets interface ip addr
+    {
+        perror("ioctl SIOCGIFADDR");
+        exit(1);
+    }
     struct sockaddr_in* addr_in = (struct sockaddr_in*)&ifr.ifr_addr;
     config.ip = ntohl(addr_in->sin_addr.s_addr); //sets server's ip
+
+    if(ioctl(sockfd, SIOCGIFHWADDR, &ifr) == -1) //gets interface mac addr
+    {
+        perror("ioctl SIOCGiFHWADDR");
+        exit(1);
+    }
     unsigned char *ifr_mac = (unsigned char *) ifr.ifr_hwaddr.sa_data;
     memcpy(config.mac, ifr_mac, 6); //sets server's mac
 
@@ -395,16 +443,18 @@ int main()
     memset(&server, 0, sizeof(server)); 
     server.sll_family = AF_PACKET;
     server.sll_protocol = htons(ETH_P_IP);
-    server.sll_ifindex = ifr.ifr_ifindex;
     server.sll_halen = ETH_ALEN;
 
-    bind(sockfd, (struct sockaddr *) &server, sizeof(server)); 
+    if (bind(sockfd, (struct sockaddr *)&server, sizeof(server)) == -1) {
+        perror("bind");
+        exit(1);
+    }
 
     struct mmsghdr msgvec[VLEN];
     struct iovec iovecs[VLEN];
     unsigned char bufs[VLEN][MAX_PACKET_SIZE];
     struct timespec timeout;
-    timeout.tv_sec = 10;
+    timeout.tv_sec = 1;
     timeout.tv_nsec = 0;
 
     //initialize msgvec
@@ -421,12 +471,14 @@ int main()
     rb.count = 0;
     rb.head = 0;
     rb.tail = 0;
+    clock_gettime(CLOCK_MONOTONIC, &rb.last_p_time);
     memset(rb.requests, 0, sizeof(rb.requests));
 
     //initialize payload DHCP bufs, request DHCP fields
     unsigned char received_buf[VLEN][MAX_DHCP];
     dhcp_fields requests[MAX_RING_BUF_SIZE]; //syncronized with ring buffer
-
+    struct timespec now; //for checking timeout
+    double dif_time;
 
     //infinity receive cycle
     while(1)
@@ -438,13 +490,16 @@ int main()
                 int p_len = packet_parser(received_buf[i], bufs[i]);
                 if (p_len <= 0) continue;
                 printf("Packet received: %d\n", received);
-                dhcp_receiver(received_buf[i], rb.requests[rb.tail], &requests[rb.tail]);
+                if (dhcp_receiver(received_buf[i], rb.requests[rb.tail], &requests[rb.tail]) < 0) continue;
                 if (new_rb_record(&rb))
                 {
                     rb_process(&rb, ctx, requests, sockfd, server);
                 }
             }
-            if (rb.count >= RING_BUF_TRIGGER_COUNT)
+            //checking ring buffer's tineout
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            dif_time = now.tv_sec - rb.last_p_time.tv_sec;
+            if ((rb.count >= RING_BUF_TRIGGER_COUNT) || dif_time >= RING_BUF_TIMEOUT)
             {
                 rb_process(&rb, ctx, requests, sockfd, server);
             }
