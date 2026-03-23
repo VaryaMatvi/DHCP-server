@@ -265,6 +265,46 @@ uint16_t ip_checksum(void *vdata, size_t length) {
     return htons(~acc);
 }
 
+uint16_t udp_checksum(const char *ip_source, const char *ip_dest, const char *udp, uint16_t udp_length)
+{
+    unsigned char ip_pseudo[12];
+    memcpy(ip_pseudo, ip_source, 4); 
+    memcpy(ip_pseudo+4, ip_dest, 4);
+    ip_pseudo[8] = 0; //0
+    ip_pseudo[9] = 17; //protocol (UDP)
+    uint16_t udp_length_n = htons(udp_length);
+    memcpy(ip_pseudo+10, &udp_length_n, 2); //udp_length
+
+    uint32_t acc = 0;
+    uint16_t word;
+
+    for (int i=0; i<12; i+=2) //always even
+    {
+        word = 0;
+        memcpy(&word, ip_pseudo + i, 2);
+        acc += ntohs(word);
+        if (acc > 0xffff) acc = (acc & 0xffff) + 1; //end-around carry
+    }
+
+    for (int i=0; i < udp_length - 1; i+=2) //UDP + payload (except last byte)
+    {
+        word = 0;
+        memcpy(&word, udp+i, 2);
+        acc += ntohs(word);
+        if (acc > 0xffff) acc = (acc & 0xffff) + 1; //end-around carry
+    }
+
+    if (udp_length & 1) //check if odd
+    {
+        word = 0;
+        memcpy(&word, udp + udp_length - 1, 1);
+        acc += ntohs(word);
+        if (acc > 0xffff) acc = (acc & 0xffff) + 1; //end-around carry
+    }
+
+    return htons(~acc);
+}
+
 //builds the packet to answer (packet buf_ans), returns total len
 int packet_formater(const unsigned char *data_buf, int data_buf_size, unsigned char *packet_buf_ans, dhcp_fields *fields)
 {
@@ -310,6 +350,9 @@ int packet_formater(const unsigned char *data_buf, int data_buf_size, unsigned c
     memset(udp_header+6, 0, 2); //zero checksum
 
     memcpy(udp_header+8, data_buf, data_buf_size);
+
+    uint16_t udp_chsum = udp_checksum(ip_header + 12, ip_header + 16, udp_header, data_buf_size + 8);
+    memcpy(udp_header + 6, &udp_chsum, 2);
 
     return 14 + 20 + 8 + data_buf_size; //ethernet + ip + udp + payload
 }
@@ -496,7 +539,7 @@ int main()
                     rb_process(&rb, ctx, requests, sockfd, server);
                 }
             }
-            //checking ring buffer's tineout
+            //checking ring buffer's timeout
             clock_gettime(CLOCK_MONOTONIC, &now);
             dif_time = now.tv_sec - rb.last_p_time.tv_sec;
             if ((rb.count >= RING_BUF_TRIGGER_COUNT) || dif_time >= RING_BUF_TIMEOUT)
